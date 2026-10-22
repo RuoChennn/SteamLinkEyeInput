@@ -1,0 +1,6 @@
+{
+  "driver_steamlinkeyeinput": {
+    "enable": true,
+    "loadPriority": 120
+  }
+}

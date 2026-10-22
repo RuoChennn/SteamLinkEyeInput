@@ -1,0 +1,14 @@
+{
+  "source": "builtin",
+  "applications": [{
+    "app_key": "steamlinkeyeinput.control",
+    "launch_type": "binary",
+    "binary_path_windows": "SteamLinkEyeInputControl.exe",
+    "arguments": "--vr --tray",
+    "is_dashboard_overlay": true,
+    "strings": {
+      "en_us": {"name": "Eye Input", "description": "Steam Link eye input controls"},
+      "zh_cn": {"name": "Eye Input 眼追调节", "description": "Steam Link 眼追开关和幅度调节"}
+    }
+  }]
+}

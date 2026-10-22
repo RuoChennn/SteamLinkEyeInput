@@ -1,0 +1,8 @@
+{
+  "name": "steamlinkeyeinput",
+  "directory": "",
+  "resourceOnly": false,
+  "alwaysActivate": true,
+  "showEnableInSettings": true,
+  "hmd_presence": []
+}
