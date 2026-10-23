@@ -50,7 +50,7 @@ inline bool Parse(const uint8_t* p,size_t size,std::vector<Message>& messages,co
     return true;
 }
 struct Config {
-    bool enabled=true,flipX=false,flipY=false;
+    bool enabled=true,flipX=false,flipY=false,showGazeCenter=false;
     int port=9100;
     float yaw=35,pitch=30,depth=2;
     Addresses addresses=DefaultAddresses();

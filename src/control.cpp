@@ -20,7 +20,7 @@
 #pragma comment(lib,"dxgi.lib")
 namespace fs=std::filesystem;
 static fs::path root;
-static HWND window,statusLabel,detailLabel,yawSlider,pitchSlider,yawLabel,pitchLabel,enabledBox,flipXBox,flipYBox;
+static HWND window,statusLabel,detailLabel,yawSlider,pitchSlider,yawLabel,pitchLabel,enabledBox,flipXBox,flipYBox,markerBox;
 static HFONT font,titleFont;static bool loading=false,pending=false;
 static std::map<std::string,std::string> changes;
 static NOTIFYICONDATAW tray{};static bool hotkeyRegistered=false;
@@ -59,7 +59,13 @@ static std::string Number(double value){std::ostringstream out;out.imbue(std::lo
 static std::string Patch(std::string text,const std::map<std::string,std::string>& fields) {
     for(const auto& field:fields) {
         std::regex pattern("(^|\\n)("+field.first+"=)[^\\r\\n]*");
-        if(!std::regex_search(text,pattern))throw std::runtime_error("Missing config field");
+        if(!std::regex_search(text,pattern)){
+            if(field.first!="show_gaze_center")throw std::runtime_error("Missing config field");
+            std::regex section("(\\[steamlinkeyeinput\\]\\r?\\n)");
+            if(!std::regex_search(text,section))throw std::runtime_error("Missing config section");
+            text=std::regex_replace(text,section,"$1show_gaze_center="+field.second+"\r\n",std::regex_constants::format_first_only);
+            continue;
+        }
         text=std::regex_replace(text,pattern,"$1"+field.first+"="+field.second);
     }
     return text;
@@ -97,6 +103,7 @@ static void Reload(bool remember=false) {
     SendMessageW(enabledBox,BM_SETCHECK,Setting(text,"enabled",1)?BST_CHECKED:BST_UNCHECKED,0);
     SendMessageW(flipXBox,BM_SETCHECK,Setting(text,"flip_x",0)?BST_CHECKED:BST_UNCHECKED,0);
     SendMessageW(flipYBox,BM_SETCHECK,Setting(text,"flip_y",0)?BST_CHECKED:BST_UNCHECKED,0);
+    SendMessageW(markerBox,BM_SETCHECK,Setting(text,"show_gaze_center",0)?BST_CHECKED:BST_UNCHECKED,0);
     RefreshNumbers();loading=false;
 }
 static void Queue(const char* key,const std::string& value){changes[key]=value;pending=true;SetTimer(window,2,180,nullptr);}
@@ -139,7 +146,7 @@ static void RenderVR() {
     text(24,309,L"垂直幅度 / Vertical");button({24,340,116,384},L"− 0.5");button({444,340,536,384},L"+ 0.5");text(245,349,label(pitchLabel));
     button({24,413,268,452},SendMessageW(flipXBox,BM_GETCHECK,0,0)==BST_CHECKED?L"左右反转：开":L"左右反转：关");
     button({292,413,536,452},SendMessageW(flipYBox,BM_GETCHECK,0,0)==BST_CHECKED?L"上下反转：开":L"上下反转：关");
-    text(24,474,L"中心校准使用 PaperTracker · 无额外回中偏移");
+    button({24,464,536,503},SendMessageW(markerBox,BM_GETCHECK,0,0)==BST_CHECKED?L"高清区中心标记：开 / Marker ON":L"高清区中心标记：关 / Marker OFF");
     GdiFlush();auto bytes=static_cast<uint8_t*>(pixels);for(int i=0;i<560*510;++i)bytes[i*4+3]=255;
     vr::EVROverlayError error=vr::VROverlayError_RequestFailed;
     if(!gpu) {
@@ -166,6 +173,7 @@ static void PollVR() {
             auto pos=SendMessageW(slider,TBM_GETPOS,0,0);SendMessageW(slider,TBM_SETPOS,TRUE,std::clamp<LRESULT>(pos+(x<116?-5:5),50,900));
             SendMessageW(window,WM_HSCROLL,0,reinterpret_cast<LPARAM>(slider));Save();
         }else if(y>=413&&y<=452){int id=x<280?11:12;HWND box=id==11?flipXBox:flipYBox;SendMessageW(box,BM_SETCHECK,SendMessageW(box,BM_GETCHECK,0,0)==BST_CHECKED?BST_UNCHECKED:BST_CHECKED,0);SendMessageW(window,WM_COMMAND,id,0);}
+        else if(y>=464&&y<=503){SendMessageW(markerBox,BM_SETCHECK,SendMessageW(markerBox,BM_GETCHECK,0,0)==BST_CHECKED?BST_UNCHECKED:BST_CHECKED,0);SendMessageW(window,WM_COMMAND,13,0);}
         RenderVR();
     }
     vr::VREvent_t systemEvent{};while(vr::VRSystem()->PollNextEvent(&systemEvent,sizeof(systemEvent)))if(systemEvent.eventType==vr::VREvent_Quit){vr::VRSystem()->AcknowledgeQuit_Exiting();DestroyWindow(window);return;}
@@ -189,7 +197,7 @@ static LRESULT CALLBACK Proc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
         for(auto slider:{yawSlider,pitchSlider}){SendMessageW(slider,TBM_SETRANGEMIN,FALSE,50);SendMessageW(slider,TBM_SETRANGEMAX,TRUE,900);SendMessageW(slider,TBM_SETPAGESIZE,0,10);}
         flipXBox=Add(L"BUTTON",L"左右反转",BS_AUTOCHECKBOX|WS_TABSTOP,24,363,150,26,11);flipYBox=Add(L"BUTTON",L"上下反转",BS_AUTOCHECKBOX|WS_TABSTOP,194,363,150,26,12);
         Add(L"BUTTON",L"撤销本次幅度调整",BS_PUSHBUTTON|WS_TABSTOP,24,410,215,35,30);Add(L"BUTTON",L"重新读取设置",BS_PUSHBUTTON|WS_TABSTOP,260,410,170,35,31);
-        Add(L"STATIC",L"中心校准使用 PaperTracker；本面板不保存回中偏移。",0,24,461,510,27);
+        markerBox=Add(L"BUTTON",L"显示高清区中心标记（原生 Eye Cross）",BS_AUTOCHECKBOX|WS_TABSTOP,24,461,510,28,13);
         try{Reload(true);}catch(...){Label(statusLabel,L"未找到插件配置文件");}
         tray.cbSize=sizeof(tray);tray.hWnd=hwnd;tray.uID=1;tray.uFlags=NIF_ICON|NIF_MESSAGE|NIF_TIP;tray.uCallbackMessage=WM_APP+1;tray.hIcon=LoadIconW(nullptr,IDI_APPLICATION);
         wcscpy_s(tray.szTip,L"SteamLinkEyeInput · Ctrl+Alt+E");Shell_NotifyIconW(NIM_ADD,&tray);
@@ -197,7 +205,7 @@ static LRESULT CALLBACK Proc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
         if(!hotkeyRegistered)SetWindowTextW(hwnd,L"SteamLinkEyeInput 快速调节（快捷键被占用，请用托盘）");
         SetTimer(hwnd,1,500,nullptr);UpdateStatus();return 0;}
     case WM_HSCROLL:if(!loading){auto slider=reinterpret_cast<HWND>(lp);if(slider==yawSlider||slider==pitchSlider){Queue(slider==yawSlider?"yaw":"pitch",Number(SendMessageW(slider,TBM_GETPOS,0,0)/10.));RefreshNumbers();}}return 0;
-    case WM_COMMAND:if(HIWORD(wp)==BN_CLICKED){int id=LOWORD(wp);if(id==40){ShowPanel();return 0;}if(id==41){if(Save())DestroyWindow(hwnd);return 0;}if(id>=10&&id<=12){HWND checkbox=id==10?enabledBox:id==11?flipXBox:flipYBox;Queue(id==10?"enabled":id==11?"flip_x":"flip_y",SendMessageW(checkbox,BM_GETCHECK,0,0)==BST_CHECKED?"1":"0");Save();}else if(id==30){Queue("yaw",Number(initialYaw));Queue("pitch",Number(initialPitch));if(Save())Reload();}else if(id==31){if(Save())try{Reload();}catch(...){Label(statusLabel,L"重新读取失败");}}}return 0;
+    case WM_COMMAND:if(HIWORD(wp)==BN_CLICKED){int id=LOWORD(wp);if(id==40){ShowPanel();return 0;}if(id==41){if(Save())DestroyWindow(hwnd);return 0;}if(id==13){Queue("show_gaze_center",SendMessageW(markerBox,BM_GETCHECK,0,0)==BST_CHECKED?"1":"0");Save();}else if(id>=10&&id<=12){HWND checkbox=id==10?enabledBox:id==11?flipXBox:flipYBox;Queue(id==10?"enabled":id==11?"flip_x":"flip_y",SendMessageW(checkbox,BM_GETCHECK,0,0)==BST_CHECKED?"1":"0");Save();}else if(id==30){Queue("yaw",Number(initialYaw));Queue("pitch",Number(initialPitch));if(Save())Reload();}else if(id==31){if(Save())try{Reload();}catch(...){Label(statusLabel,L"重新读取失败");}}}return 0;
     case WM_HOTKEY:if(wp==1)ShowPanel();return 0;
     case WM_APP+1:if(lp==WM_LBUTTONUP||lp==WM_LBUTTONDBLCLK)ShowPanel();else if(lp==WM_RBUTTONUP){HMENU menu=CreatePopupMenu();AppendMenuW(menu,MF_STRING,40,L"打开调节面板　Ctrl+Alt+E");AppendMenuW(menu,MF_STRING,41,L"退出面板（插件继续工作）");POINT point;GetCursorPos(&point);SetForegroundWindow(hwnd);TrackPopupMenu(menu,TPM_RIGHTBUTTON,point.x,point.y,0,hwnd,nullptr);DestroyMenu(menu);PostMessageW(hwnd,WM_NULL,0,0);}return 0;
     case WM_APP+2:StartVR(true);return 0;
@@ -212,7 +220,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show) {
     try{if(fs::exists(root/L"install-location.txt")){auto text=Read(root/L"install-location.txt");root=fs::path(std::wstring(text.begin(),text.end()));}}catch(...){}
     bool test=false,startHidden=false,startVR=false,unregisterVR=false;for(int i=1;i<argc;++i){if(!wcscmp(argv[i],L"--root")&&i+1<argc)root=argv[++i];else if(!wcscmp(argv[i],L"--self-test"))test=true;else if(!wcscmp(argv[i],L"--tray"))startHidden=true;else if(!wcscmp(argv[i],L"--vr"))startVR=true;else if(!wcscmp(argv[i],L"--unregister-vr"))unregisterVR=true;}LocalFree(argv);
     if(unregisterVR){if(auto existing=FindWindowW(L"SteamLinkEyeInputControl",nullptr)){SendMessageW(existing,WM_APP+4,0,0);return 0;}vr::EVRInitError error;vr::VR_Init(&error,vr::VRApplication_Utility);if(error)return 3;vr::VRApplications()->SetApplicationAutoLaunch("steamlinkeyeinput.control",false);auto result=vr::VRApplications()->RemoveApplicationManifest((root/L"steamlinkeyeinput.vrmanifest").u8string().c_str());vr::VR_Shutdown();if(result==vr::VRApplicationError_None)DeleteFileW((root/L"dashboard-registered").c_str());return result==vr::VRApplicationError_None?0:4;}
-    if(test){try{auto text=Patch("[steamlinkeyeinput]\r\nyaw=32\r\npitch=28\r\naddress_EyeLeftX=/papertracker/EyeLeftX\r\n",{{"yaw","40"}});if(Setting(text,"yaw",0)!=40||Setting(text,"pitch",0)!=28||text.find("address_EyeLeftX=/papertracker/EyeLeftX")==std::string::npos)return 2;return 0;}catch(...){return 1;}}
+    if(test){try{auto text=Patch("[steamlinkeyeinput]\r\nyaw=32\r\npitch=28\r\naddress_EyeLeftX=/papertracker/EyeLeftX\r\n",{{"yaw","40"}});text=Patch(text,{{"show_gaze_center","1"}});text=Patch(text,{{"show_gaze_center","0"}});if(Setting(text,"show_gaze_center",-1)!=0)return 3;if(Setting(text,"yaw",0)!=40||Setting(text,"pitch",0)!=28||text.find("address_EyeLeftX=/papertracker/EyeLeftX")==std::string::npos)return 2;return 0;}catch(...){return 1;}}
     HANDLE singleton=CreateMutexW(nullptr,FALSE,L"Local\\SteamLinkEyeInputControl");
     if(singleton&&GetLastError()==ERROR_ALREADY_EXISTS){HWND existing=FindWindowW(L"SteamLinkEyeInputControl",nullptr);if(existing){if(startVR)PostMessageW(existing,WM_APP+2,0,0);else{ShowWindow(existing,SW_RESTORE);SetForegroundWindow(existing);}}CloseHandle(singleton);return 0;}
     SetProcessDPIAware();INITCOMMONCONTROLSEX common{sizeof(common),ICC_BAR_CLASSES};InitCommonControlsEx(&common);

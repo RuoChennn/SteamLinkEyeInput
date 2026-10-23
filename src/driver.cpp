@@ -12,6 +12,7 @@
 #include <filesystem>
 #include "vendor/openvr_driver.h"
 #include "gaze.h"
+#include "marker.h"
 #pragma comment(lib,"ws2_32.lib")
 #pragma comment(lib,"bcrypt.lib")
 
@@ -85,12 +86,24 @@ bool Apply(uint8_t* base,void* hmd,const eye::Point& point) {
         return true;
     } __except(EXCEPTION_EXECUTE_HANDLER){return false;}
 }
+// Eye Cross is encoded by Valve as sideband flag 0x100, alongside crop metadata.
+// Only used after the existing exact-binary hash and current HMD checks.
+bool SetCross(void* hmd,eye::MarkerOverride& marker,bool show) {
+    __try {return marker.Set(*(static_cast<uint8_t*>(hmd)+0x103),show);}
+    __except(EXCEPTION_EXECUTE_HANDLER){return false;}
+}
+uint64_t Session(void* hmd) {
+    __try {return hmd?*reinterpret_cast<uint64_t*>(static_cast<uint8_t*>(hmd)+0x958):0;}
+    __except(EXCEPTION_EXECUTE_HANDLER){return 0;}
+}
 class Provider:public vr::IServerTrackedDeviceProvider {
     vr::IVRDriverLog* log=nullptr;vr::IVRServerDriverHost* host=nullptr;
     std::atomic<bool> stop{false};std::thread worker;
     std::atomic<uint8_t*> verified{nullptr};HMODULE pinned=nullptr;
     std::atomic<bool> shown{false},connected{false},enabled{true},fault{false};
     std::atomic<uint64_t> accepted{0},packets{0},bad{0};
+    std::atomic<bool> markerDesired{false},markerActive{false};
+    eye::MarkerOverride marker;uint64_t lastSession=0;
     std::atomic<int> socketError{0};std::mutex lock;eye::Point latest;
     uint64_t lastSequence=0,lastShow=0;void* lastHmd=nullptr;bool active=false;
     std::filesystem::path root;
@@ -120,6 +133,7 @@ class Provider:public vr::IServerTrackedDeviceProvider {
                 }
                 float number=std::stof(value);if(!std::isfinite(number))return previous;
                 if(key=="enabled"){if(number!=0&&number!=1)return previous;result.enabled=number!=0;}
+                else if(key=="show_gaze_center"){if(number!=0&&number!=1)return previous;result.showGazeCenter=number!=0;}
                 else if(key=="flip_x"){if(number!=0&&number!=1)return previous;result.flipX=number!=0;}
                 else if(key=="flip_y"){if(number!=0&&number!=1)return previous;result.flipY=number!=0;}
                 else if(key=="port"){if(number<1024||number>65535||floorf(number)!=number)return previous;result.port=int(number);}
@@ -141,6 +155,7 @@ class Provider:public vr::IServerTrackedDeviceProvider {
            <<",\n  \"osc_options_shown\": "<<(shown.load()?"true":"false")
            <<",\n  \"headset_connected\": "<<(connected.load()?"true":"false")
            <<",\n  \"enabled\": "<<(config.enabled?"true":"false")
+           <<",\n  \"show_gaze_center\": "<<(markerActive.load()?"true":"false")
            <<",\n  \"fault\": "<<(fault.load()?"true":"false")
            <<",\n  \"packets\": "<<packets.load()<<",\n  \"rejected_packets\": "<<bad.load()
            <<",\n  \"accepted_points\": "<<accepted.load()
@@ -159,7 +174,7 @@ class Provider:public vr::IServerTrackedDeviceProvider {
         bool checked=false;
         while(!stop) {
             auto now=GetTickCount64();
-            if(now-lastConfig>=500 || !lastConfig){config=ReadConfig(config);enabled=config.enabled;lastConfig=now;}
+            if(now-lastConfig>=500 || !lastConfig){config=ReadConfig(config);enabled=config.enabled;markerDesired=config.showGazeCenter;lastConfig=now;}
             if(!checked && now-lastVerify>=1000) {
                 HMODULE module=nullptr;
                 if(GetModuleHandleExW(0,L"driver_vrlink.dll",&module)) {
@@ -199,6 +214,7 @@ public:
         log=static_cast<vr::IVRDriverLog*>(context->GetGenericInterface(vr::IVRDriverLog_Version));
         host=static_cast<vr::IVRServerDriverHost*>(context->GetGenericInterface(vr::IVRServerDriverHost_Version));
         root=Root();stop=false;fault=false;shown=false;connected=false;verified=nullptr;socketError=0;enabled=true;started=GetTickCount64();dashboardRequested=false;
+        marker={};lastSession=0;markerDesired=false;markerActive=false;
         lastSequence=lastShow=0;lastHmd=nullptr;active=false;accepted=0;packets=0;bad=0;latest={};
         try{worker=std::thread([this]{try{Work();}catch(...){fault=true;Log("SteamLinkEyeInput: worker stopped after exception.");}});}
         catch(...){return vr::VRInitError_Driver_Failed;}
@@ -228,8 +244,11 @@ public:
         void* hmd=CurrentHmd(base);
         if(host) {vr::TrackedDevicePose_t pose{};host->GetRawTrackedDevicePoses(0,&pose,1);if(!pose.bDeviceIsConnected)hmd=nullptr;}
         connected=hmd!=nullptr;
-        if(hmd!=lastHmd){lastHmd=hmd;lastSequence=0;active=false;}
+        auto session=Session(hmd);
+        if(hmd!=lastHmd || session!=lastSession){lastHmd=hmd;lastSession=session;lastSequence=0;active=false;marker={};markerActive=false;}
         if(!hmd)return;
+        if(!SetCross(hmd,marker,markerDesired && enabled)){fault=true;return;}
+        markerActive=markerDesired && enabled;
         eye::Point point;
         {std::unique_lock<std::mutex> guard(lock,std::try_to_lock);if(!guard.owns_lock())return;point=latest;}
         now=GetTickCount64();

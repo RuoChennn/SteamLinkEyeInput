@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <stdexcept>
 #include "../src/gaze.h"
+#include "../src/marker.h"
 #include "../src/vendor/openvr_driver.h"
 #pragma comment(lib,"ws2_32.lib")
 void Check(bool condition,const char* message){if(!condition)throw std::runtime_error(message);}
@@ -21,6 +22,14 @@ struct Context:vr::IVRDriverContext {
 };
 int wmain(int argc,wchar_t** argv) {
     try {
+        eye::MarkerOverride marker;uint8_t cross=0;
+        Check(marker.Set(cross,false)&&cross==0,"marker default off leaves native state untouched");
+        Check(marker.Set(cross,true)&&cross==1,"marker on");
+        Check(marker.Set(cross,true)&&cross==1,"repeated marker on preserves original");
+        Check(marker.Set(cross,false)&&cross==0,"marker off restores original");
+        cross=1;Check(marker.Set(cross,true)&&marker.Set(cross,false)&&cross==1,"native preexisting marker preserved");
+        cross=7;Check(!marker.Set(cross,true)&&cross==7,"unknown native flag rejected");
+        marker={};cross=0;Check(marker.Set(cross,false)&&cross==0,"reconnect resets override ownership");
         eye::Tracker tracker;eye::Config config;eye::Point point;std::vector<eye::Message> parsed;
         for(int i=0;i<6;++i){auto bytes=Message(eye::Names[i],i<4?.5f:1.f);parsed.clear();Check(eye::Parse(bytes.data(),bytes.size(),parsed),"OSC float decode");Check(parsed.size()==1&&parsed[0].index==i,"OSC parameter identity");tracker.Accept(parsed,1000,config,point);}
         Check(point.x>0&&point.y>0&&point.z==-2&&point.valid,"No-flip gaze direction");
