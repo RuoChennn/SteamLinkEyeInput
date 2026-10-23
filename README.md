@@ -1,65 +1,32 @@
 # SteamLinkEyeInput
 
-把外部 OSC 眼动数据送入 Steam Link 的原生注视点串流通道，并提供 SteamVR 仪表盘与桌面快速调节工具。
+把外部 OSC 眼动数据送入 Steam Link 的原生注视点串流通道，提供 SteamVR 仪表盘与桌面调节工具。支持 PaperTracker 和可配置 OSC 地址的其他上游软件，使用原版 Steam Link 客户端。
 
-**实验项目，目前仅适配一个已验证的 SteamVR / Steam Link 驱动版本及 Quest 3。** 输入协议可配置，不依赖某个眼追硬件品牌；随附 PaperTracker 的 OSC 地址示例。它不是 Valve 或 PaperTracker 官方插件。
+**实验项目：实机基线为 SteamVR 2.18.4 / Quest 3。** 编码输入依赖 Valve 私有处理函数；结构发现减少了固定地址依赖，但不保证所有真实版本兼容。不是 Valve 或 PaperTracker 官方插件。
 
 ## 功能
 
-- OpenVR 服务端加载项随 SteamVR 启动，在 `vrserver.exe` 内接收本机 OSC 数据。
-- 自动显示 Steam Link 的 OSC 选项，不更改眼追共享许可或原有 OSC 输出设置。
-- 眼动不经过外部转发进程；外部调节工具只修改配置、显示状态。
-- 头显内的 SteamVR 仪表盘入口：**Eye Input / 眼追调节**。
-- 桌面面板、托盘入口与全局快捷键 **Ctrl + Alt + E**；关闭窗口收起到托盘。
-- 水平、垂直幅度调节范围 **5–90°**；方向开关；持续眼追开关。
-- 校准由 PaperTracker 或其他上游软件负责，不保存独立回中偏移。
+- OpenVR 服务端加载项在 vrserver 内直接接收本机 OSC，不需要外部转发进程。
+- 水平／垂直幅度 5–90°，左右／上下反转，持续眼追启停。
+- 独立中心微调：左／右／上／下每次 0.5°，范围 ±20°，支持偏移归零。约 0.5 秒热加载，保留上游校准。
+- SteamVR 仪表盘入口 **Eye Input**、桌面面板、托盘及 **Ctrl + Alt + E** 快捷键。
+- **高清区画框 + 中心点**：保留原生画框，在双眼实际裁剪框中心绘制绿点，用户已确认居中且不会被控制面板遮挡。
 
-## 如何工作
+## 工作方式和兼容性
 
-```mermaid
-flowchart TD
-    A[眼追硬件] -->|USB COM| B[PaperTracker PC 端：计算与校准]
-    B -->|OSC / UDP 127.0.0.1:9100| C[SteamVR 进程内插件]
-    C -->|坐标转换并提交注视点| D[Steam Link 原生眼动处理]
-    D --> E[更新双眼编码裁剪与高清区域]
-    E --> F[串流到 Quest 3]
-```
+上游校准后的归一化坐标通过 OSC 进入插件。插件应用幅度、方向和中心微调，生成以米表示的 HMD 相对目标点（+X 右、+Y 上、-Z 前），组装原生眼动包交给 Steam Link 的现有处理链，后者完成双眼投影与编码裁剪。过期或闭眼输入不会作为有效视线持续提交。
 
-### 1. 上游软件取得和校准视线
+主路径通过消息特征、Windows 链式展开表、MSVC RTTI、接收／编码指令及构造字段关系交叉定位；不再写死接收函数 RVA、HMD 虚表 RVA、Provider 全局地址或使用的对象字段偏移。每帧经导出的 HmdDriverFactory 获取 Provider，核对 HMD 类型、所有权与会话。匹配缺失、歧义或冲突时停止私有调用，不猜测地址。
 
-以 PaperTracker 为例，眼追硬件通过 USB COM 连接电脑，由 PC 端计算并校准视线，再通过 OSC 输出左右眼的水平、垂直坐标。插件直接使用上游校准后的数据，不保存第二套回中偏移。两个可选的眼睑通道用于排除闭眼时的视线。
-
-输入地址可以配置，因此模块也能适配输出相同类型数据的其他软件。
-
-### 2. 插件随 SteamVR 加载并接收 OSC
-
-安装脚本通过 `vrpathreg` 注册 OpenVR 加载项。SteamVR 启动后，将插件 DLL 加载进 `vrserver.exe`，工作线程在本机 `127.0.0.1:9100/UDP` 接收 OSC 消息。
-
-**9100 是本插件新增的输入端口，并非 Valve 原有的通用眼追输入端口。** 上游软件必须发送到相同端口，并使用与配置匹配的 OSC 地址；眼动不经过外部转发程序。
-
-### 3. 将二维眼动转换成三维目标点
-
-[`src/gaze.h`](src/gaze.h) 等待四个必要坐标通道更新，取有效睁眼的平均视线，应用可选的方向反转，再按下式构造目标点：
+当前识别 MSVC x64 / D3D11 的代码形态。函数搬移后的内存副本测试通过，**不等于多个真实版本已经实测**。可选 OSC 菜单辅助仍依赖精确哈希，不是主路径提交的必要条件。当前已验证 Valve DLL SHA-256：
 
 ```text
-水平角 = clamp(clamp(水平输入, -1, 1) × yaw, -89°, 89°)
-垂直角 = clamp(clamp(垂直输入, -1, 1) × pitch, -89°, 89°)
-X = depth × tan(水平角)
-Y = depth × tan(垂直角)
-Z = -depth
+8e7100b6b1e88d3ad6dd05f30f030dc9a69b092b64a60d35347cebb5c516b55d
 ```
 
-默认 `yaw=35°`、`pitch=30°`、`depth=2`；计算正切时角度换算为弧度。面板中的幅度调整改变角度比例，也就是注视点移动距离；它不调整高清区域大小。设置上限为 90°，实际目标角限制在 ±89°，以避免数值发散。
+中心点由电脑控制面板读取带序列号的共享内存裁剪快照，按每眼实际投影矩阵反算位置，以双眼纹理覆盖层绘制。0.35 米头部相对平面及前景排序防止面板遮挡；改距离时保持画面坐标和角尺寸。面板需保持运行，暂停、断线和数据过期时隐藏中心点。绿点不改变编码裁剪或眼追校准。
 
-### 4. 交给 Steam Link 原生处理和编码
-
-[`src/driver.cpp`](src/driver.cpp) 先校验 `driver_vrlink.dll` 的 SHA-256，确认匹配已适配版本，再取得当前连接的 Quest 3 对象。在 SteamVR 的 `RunFrame` 中，插件将最新目标点组成内部眼动数据包，调用 Steam Link 原有的眼动处理函数。
-
-之后由 Valve 原有代码完成双眼投影、注视位置更新及编码裁剪，最终使串流画面的高清区域随视线移动。这条接入路径依赖 **Valve 私有布局与处理函数**，并非公开、稳定的标准眼追接口；版本校验不匹配时会停止私有调用。
-
-本项目实现注视点串流质量分配，不会自动使所有游戏减少周边区域的渲染计算量。显示 OSC 菜单与提交眼动是独立步骤，仅显示菜单不代表外部眼动已进入编码器。
-
-启用 **Eye Input → 高清区中心标记** 可切换 Steam Link 原生 Eye Cross 调试标记；桌面面板提供同名复选框。默认关闭，配置为 `show_gaze_center=0/1`，约 0.5 秒内应用。此功能沿用相同的驱动版本校验；标记在头显中的实际位置仍需视觉验收。
+已删除未采用的官方输入后端、切换按钮、NDC 专用诊断和外置层／客户端改包实验工具。必要的结果与边界见 [未采用路线记录](docs/research-history.md)。公开 API 返回成功不能替代串流效果验收。
 
 ## 安装和使用
 
@@ -96,27 +63,18 @@ powershell -NoProfile -ExecutionPolicy Bypass -File Install.ps1 -SteamVR "C:\Pro
 
 配置约每 0.5 秒重新读取。不要同时运行占用 UDP 9100 的旧桥接程序。若误改参数地址，可能出现“收到数据包但没有有效注视点”。
 
-## 兼容性和已知限制
 
-已验证的 `driver_vrlink.dll`：SteamVR **2.18.4**，SHA-256：
+## 状态和限制
 
-```text
-8e7100b6b1e88d3ad6dd05f30f030dc9a69b092b64a60d35347cebb5c516b55d
-```
-
-本项目使用官方 OpenVR 加载和仪表盘 API，但将眼动接入编码器的部分依赖该版本的 Valve 私有布局与处理函数。校验不匹配时停止私有调用；SteamVR 更新后可能需要重新适配。当前只向 Quest 3 内部型号提交数据。
-
-端口 9100 是**本插件新增的接收入口**。Valve 原有的 OSC 通道不能据此视为通用眼追输入端口。数据进入原生编码处理并不意味着具备 Quest Pro 的完整硬件时序或精度。
-
-- 已验证：真实眼动进入原生处理函数，双眼编码裁剪随之变化；仪表盘入口和点击可用。
-- 仪表盘采用持久 D3D11 纹理；用户已确认替换原始位图刷新后闪烁消失。
-- 用户仍报告约 **0.5 秒**的高清区跟随延迟，尚未完成端到端归因或修复。不能把状态中的 `data_age_ms` 当作端到端延迟。
-- 中央准确但边缘有误差的问题尚未完全解决。当前标量到角度的换算仍是近似，固定深度也可能影响双眼投影。
-- 90° 上限需要加载新版服务端 DLL；更新后应重启 SteamVR。数值有限性已通过本地测试，最终头显体验仍需验收。
+- status.json 提供结构匹配结果、发现的函数／虚表 RVA、收包和提交计数、数据年龄及异常状态。
+- dashboard-status.json 提供覆盖层错误码及 center_dot_active。程序显示 active 不等同于视觉验收。
+- 用户已确认当前环境的高清区跟随、中心微调及绿点居中／不被面板遮挡。
+- data_age_ms 只表示插件收到数据后的年龄，不能当作端到端延迟。此前报告的跟随延迟尚未完成端到端归因。
+- 标量到角度与固定深度仍是近似；边缘精度及其他真实版本需要另行验证。
 
 ## 构建和测试
 
-需要 Windows x64、Visual Studio 2022 或 2019 的 C++ 桌面开发组件，以及 CMake 3.20 或更高版本。
+需要 Windows x64、Visual Studio 2022 或 2019 C++ 桌面组件、CMake 3.20+。
 
 ```powershell
 cmake -S . -B build -A x64
@@ -125,20 +83,17 @@ ctest --test-dir build -C Release --output-on-failure
 cmake --install build --config Release --prefix dist/SteamLinkEyeInput
 ```
 
-GitHub Actions 在 Windows 上执行同样的配置、构建、测试和运行包生成。工作流上传构建产物，不自动创建公开 Release。
+可用 `-DSTEAMLINK_DRIVER_TEST_FILE=本地driver_vrlink.dll路径` 启用只读真实 DLL 测试。测试不加载／执行厂商 DLL；覆盖函数 RVA 搬移、歧义候选、字段冲突和损坏 PE 拒绝。厂商文件不随项目分发，CI 不下载它。
 
-测试覆盖 OSC 解析、自定义地址、上游校准直通、方向、闭眼、过期数据、90° 数值保护、实际本机 UDP 接收、加载／卸载以及面板修改配置时保留其他字段。测试不等于硬件精度或端到端延迟测量。
+其余测试覆盖 OSC、UDP、微调、闭眼／新鲜度、加载卸载、配置保留、双眼实际裁剪中心、不对称投影矩阵往返、前景平面坐标／角尺寸不变，以及真实只读共享内存并发一致性。本机启用真实 DLL 测试时共四项 CTest。
 
-## 目录
+## 目录与许可
 
-```text
-src/driver.cpp       SteamVR 服务端加载项
-src/gaze.h           OSC 解析与坐标换算
-src/control.cpp      桌面／托盘／SteamVR 仪表盘调节工具
-src/vendor/          OpenVR SDK 头文件与导入库
-package/             安装脚本、清单、默认配置及 OpenVR 运行库
-tests/               本机自动测试
-.github/workflows/   Windows 自动构建
-```
+- src/driver.cpp：服务端接收和原生提交。
+- src/native_layout.h：保守结构发现。
+- src/center_dot.h：裁剪中心、几何及共享内存。
+- src/control.cpp：桌面／仪表盘调节与绿点覆盖层。
+- tests/：自动测试；tools/audit_vrlink_encoder.py：只读基线审计。
+- package/：安装、卸载、默认配置及 OpenVR 运行库。
 
-不包含厂商程序、Valve 的 `driver_vrlink.dll`、实际眼动记录、设备校准或个人配置。随附 OpenVR SDK 文件来自 [Valve 官方仓库](https://github.com/ValveSoftware/openvr)，遵循其 BSD 许可；项目代码遵循 MIT 许可。
+不包含厂商 APK、Valve 驱动 DLL、测试密钥、真实眼动记录或个人校准。项目代码 MIT；随附 OpenVR SDK 来自 [Valve 官方仓库](https://github.com/ValveSoftware/openvr)，遵循其 BSD 许可。

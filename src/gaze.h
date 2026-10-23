@@ -52,7 +52,7 @@ inline bool Parse(const uint8_t* p,size_t size,std::vector<Message>& messages,co
 struct Config {
     bool enabled=true,flipX=false,flipY=false,showGazeCenter=false;
     int port=9100;
-    float yaw=35,pitch=30,depth=2;
+    float yaw=35,pitch=30,depth=2,offsetYaw=0,offsetPitch=0;
     Addresses addresses=DefaultAddresses();
 };
 struct Point { float x=0,y=0,z=-2;bool valid=false;uint64_t sequence=0,time=0; };
@@ -69,15 +69,14 @@ struct Tracker {
         for(int side=0;side<2;++side) {
             // A stale lid sample is treated as unknown/open; fresh closures suppress gaze.
             if(updated[4+side] && now-updated[4+side]<=150 && values[4+side]<=.1f)continue;
-            // Calibration belongs to the upstream tracker. Never subtract a
-            // second, persisted neutral pose from its calibrated output.
+            // Upstream calibration remains intact; manual angular trim is applied below.
             x+=values[side];y+=values[2+side];++opened;
         }
         if(opened){x/=opened;y/=opened;}
         if(config.flipX)x=-x;if(config.flipY)y=-y;
         constexpr float radians=3.14159265358979323846f/180;
-        out={config.depth*std::tan(std::clamp(std::clamp(x,-1.f,1.f)*config.yaw,-89.f,89.f)*radians),
-             config.depth*std::tan(std::clamp(std::clamp(y,-1.f,1.f)*config.pitch,-89.f,89.f)*radians),
+        out={config.depth*std::tan(std::clamp(std::clamp(x,-1.f,1.f)*config.yaw+config.offsetYaw,-89.f,89.f)*radians),
+             config.depth*std::tan(std::clamp(std::clamp(y,-1.f,1.f)*config.pitch+config.offsetPitch,-89.f,89.f)*radians),
              -config.depth,opened>0,++sequence,now};
         return true;
     }

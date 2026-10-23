@@ -53,6 +53,16 @@ int wmain(int argc,wchar_t** argv) {
         bytes=Message(mapping[0],.25f);parsed.clear();
         Check(eye::Parse(bytes.data(),bytes.size(),parsed,mapping)&&parsed.size()==1&&parsed[0].index==0,"custom device address mapping");
         parsed.clear();Check(eye::Parse(bytes.data(),bytes.size(),parsed)&&parsed.empty(),"unmapped device address ignored");
+        config.offsetYaw=2;config.offsetPitch=-3;
+        tracker.Accept({{0,0},{1,0},{2,0},{3,0}},1900,config,point);
+        Check(fabs(point.x-2*std::tan(2*3.14159265/180))<.0001&&point.y<0,"manual trim shifts upstream center");
+        config.flipX=config.flipY=true;
+        tracker.Accept({{0,0},{1,0},{2,0},{3,0}},1910,config,point);
+        Check(point.x>0&&point.y<0,"manual trim directions independent of flips");
+        config.offsetYaw=config.offsetPitch=0;
+        tracker.Accept({{0,0},{1,0},{2,0},{3,0}},1920,config,point);
+        Check(fabs(point.x)<.0001f&&fabs(point.y)<.0001f,"reset manual trim restores upstream center");
+        config.flipX=config.flipY=false;config.offsetYaw=config.offsetPitch=20;
         config.yaw=config.pitch=90;
         tracker.Accept({{0,1},{1,1},{2,1},{3,1},{4,1},{5,1}},2000,config,point);
         Check(std::isfinite(point.x)&&std::isfinite(point.y)&&point.x>0&&point.y>0,"90 degree settings remain finite without flipping sign");
@@ -80,6 +90,6 @@ int wmain(int argc,wchar_t** argv) {
             WSACleanup();
             Check(FreeLibrary(dll)!=0,"clean unload");
         }
-        std::cout<<"PASS: OSC parsing, upstream-only calibration, direction/closure/freshness, real UDP reception, provider lifecycle and unload\n";return 0;
+        std::cout<<"PASS: OSC parsing, upstream calibration and manual trim, direction/closure/freshness, real UDP reception, provider lifecycle and unload\n";return 0;
     }catch(const std::exception& e){std::cerr<<"FAIL: "<<e.what()<<"\n";return 1;}
 }

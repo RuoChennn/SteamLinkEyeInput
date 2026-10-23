@@ -13,12 +13,13 @@
 #include "vendor/openvr_driver.h"
 #include "gaze.h"
 #include "marker.h"
+#include "native_layout.h"
+#include "center_dot.h"
 #pragma comment(lib,"ws2_32.lib")
 #pragma comment(lib,"bcrypt.lib")
 
 namespace {
 HMODULE selfModule;
-constexpr uintptr_t ProviderRva=0xd24ad0,HmdVtableRva=0xc38790;
 const char* ExpectedHash="8e7100b6b1e88d3ad6dd05f30f030dc9a69b092b64a60d35347cebb5c516b55d";
 std::filesystem::path Root() {
     wchar_t path[32768]{};GetModuleFileNameW(selfModule,path,32768);
@@ -52,14 +53,15 @@ bool Verify(HMODULE module) {
 }
 // Only called on the server's RunFrame thread. The current HMD is retrieved every
 // call from Valve's provider, never retained over disconnects or reconnects.
-void* CurrentHmd(uint8_t* base) {
+void* CurrentHmd(uint8_t* base,const eye::native::Layout& layout) {
     __try {
-        auto provider=base+ProviderRva;
-        auto hmd=*reinterpret_cast<uint8_t**>(provider+0x390);
-        if(!hmd || *reinterpret_cast<uintptr_t*>(hmd)!=uintptr_t(base)+HmdVtableRva ||
-           *reinterpret_cast<uint32_t*>(hmd+0x68)!=4 ||
-           *reinterpret_cast<void**>(hmd+0x950)!=provider ||
-           !*reinterpret_cast<uint64_t*>(hmd+0x958))return nullptr;
+        auto factory=reinterpret_cast<void*(*)(const char*,int*)>(GetProcAddress(reinterpret_cast<HMODULE>(base),"HmdDriverFactory"));
+        if(!factory)return nullptr;int error=0;
+        auto provider=static_cast<uint8_t*>(factory(vr::IServerTrackedDeviceProvider_Version,&error));
+        if(!provider||error)return nullptr;
+        auto hmd=*reinterpret_cast<uint8_t**>(provider+layout.providerHmd);
+        if(!hmd||uintptr_t(hmd)%8||*reinterpret_cast<uintptr_t*>(hmd)!=uintptr_t(base)+layout.hmdVtable||
+           *reinterpret_cast<void**>(hmd+layout.owner)!=provider||! *reinterpret_cast<uint64_t*>(hmd+layout.session))return nullptr;
         return hmd;
     } __except(EXCEPTION_EXECUTE_HANDLER){return nullptr;}
 }
@@ -75,31 +77,47 @@ int ShowOptions(uint8_t* base) {
             (paths,0x600000000ULL,path,true,nullptr);
     } __except(EXCEPTION_EXECUTE_HANDLER){return -4;}
 }
-bool Apply(uint8_t* base,void* hmd,const eye::Point& point) {
+bool Apply(uint8_t* base,const eye::native::Layout& layout,void* hmd,const eye::Point& point) {
     __try {
         alignas(8) uint8_t packet[0x140]{};
         *reinterpret_cast<uint32_t*>(packet)=0x1103;
         *reinterpret_cast<uint16_t*>(packet+4)=0x11;
         memcpy(packet+8,&point.x,4);memcpy(packet+12,&point.y,4);memcpy(packet+16,&point.z,4);
         packet[0x15]=point.valid?1:0;
-        reinterpret_cast<void(*)(void*,const void*)>(base+0x9e9880)(hmd,packet);
+        reinterpret_cast<void(*)(void*,const void*)>(base+layout.receive)(hmd,packet);
         return true;
     } __except(EXCEPTION_EXECUTE_HANDLER){return false;}
 }
 // Eye Cross is encoded by Valve as sideband flag 0x100, alongside crop metadata.
-// Only used after the existing exact-binary hash and current HMD checks.
-bool SetCross(void* hmd,eye::MarkerOverride& marker,bool show) {
-    __try {return marker.Set(*(static_cast<uint8_t*>(hmd)+0x103),show);}
+// Only used after structural discovery and current object identity checks.
+bool SetCross(void* hmd,const eye::native::Layout& layout,eye::MarkerOverride& marker,bool show) {
+    __try {return marker.Set(*(static_cast<uint8_t*>(hmd)+layout.marker),show);}
     __except(EXCEPTION_EXECUTE_HANDLER){return false;}
 }
-uint64_t Session(void* hmd) {
-    __try {return hmd?*reinterpret_cast<uint64_t*>(static_cast<uint8_t*>(hmd)+0x958):0;}
+uint64_t Session(void* hmd,const eye::native::Layout& layout) {
+    __try {return hmd?*reinterpret_cast<uint64_t*>(static_cast<uint8_t*>(hmd)+layout.session):0;}
     __except(EXCEPTION_EXECUTE_HANDLER){return 0;}
+}
+bool ReadCrop(void* object,const eye::native::Layout& layout,eye::DotSample& sample) {
+    __try {
+        auto hmd=static_cast<uint8_t*>(object);uint16_t meta[10]{},check[10]{};
+        if(hmd[layout.spatialMode]!=2||hmd[layout.eyeEnabled]!=1)return false;
+        auto stamp=*reinterpret_cast<uint64_t*>(hmd+layout.timestamp);
+        LARGE_INTEGER counter{},frequency{};if(!QueryPerformanceCounter(&counter)||!QueryPerformanceFrequency(&frequency)||!frequency.QuadPart)return false;
+        auto now=uint64_t(counter.QuadPart)*1000000/uint64_t(frequency.QuadPart);
+        if(!stamp||now<stamp||now-stamp>=250000)return false;
+        int square=*reinterpret_cast<int*>(hmd+layout.cropSize);
+        memcpy(meta,hmd+layout.crop,sizeof(meta));MemoryBarrier();memcpy(check,hmd+layout.crop,sizeof(check));
+        if(memcmp(meta,check,sizeof(meta))||!eye::CropCenters(meta,square,sample))return false;
+        sample.nativeStamp=stamp;sample.valid=1;return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER){return false;}
 }
 class Provider:public vr::IServerTrackedDeviceProvider {
     vr::IVRDriverLog* log=nullptr;vr::IVRServerDriverHost* host=nullptr;
     std::atomic<bool> stop{false};std::thread worker;
     std::atomic<uint8_t*> verified{nullptr};HMODULE pinned=nullptr;
+    eye::native::Layout layout;bool knownBinary=false;std::string resolution="not checked";
+    eye::DotWriter dotWriter;
     std::atomic<bool> shown{false},connected{false},enabled{true},fault{false};
     std::atomic<uint64_t> accepted{0},packets{0},bad{0};
     std::atomic<bool> markerDesired{false},markerActive{false};
@@ -139,6 +157,8 @@ class Provider:public vr::IServerTrackedDeviceProvider {
                 else if(key=="port"){if(number<1024||number>65535||floorf(number)!=number)return previous;result.port=int(number);}
                 else if(key=="yaw"){if(number<=0||number>90)return previous;result.yaw=number;}
                 else if(key=="pitch"){if(number<=0||number>90)return previous;result.pitch=number;}
+                else if(key=="offset_yaw"){if(number< -20||number>20)return previous;result.offsetYaw=number;}
+                else if(key=="offset_pitch"){if(number< -20||number>20)return previous;result.offsetPitch=number;}
                 else if(key=="depth"){if(number<.1f||number>5)return previous;result.depth=number;}
             }
         } catch(...){return previous;}
@@ -152,6 +172,9 @@ class Provider:public vr::IServerTrackedDeviceProvider {
         out<<"{\n  \"running\": "<<(!done?"true":"false")<<",\n  \"pid\": "<<GetCurrentProcessId()
            <<",\n  \"port\": "<<config.port<<",\n  \"socket_error\": "<<socketError.load()
            <<",\n  \"compatible_driver\": "<<(verified.load()?"true":"false")
+           <<",\n  \"known_driver_binary\": "<<(knownBinary?"true":"false")
+           <<",\n  \"native_resolution\": \""<<resolution<<"\""
+           <<",\n  \"native_receive_rva\": "<<layout.receive<<",\n  \"native_hmd_vtable_rva\": "<<layout.hmdVtable
            <<",\n  \"osc_options_shown\": "<<(shown.load()?"true":"false")
            <<",\n  \"headset_connected\": "<<(connected.load()?"true":"false")
            <<",\n  \"enabled\": "<<(config.enabled?"true":"false")
@@ -159,6 +182,7 @@ class Provider:public vr::IServerTrackedDeviceProvider {
            <<",\n  \"fault\": "<<(fault.load()?"true":"false")
            <<",\n  \"packets\": "<<packets.load()<<",\n  \"rejected_packets\": "<<bad.load()
            <<",\n  \"accepted_points\": "<<accepted.load()
+           <<",\n  \"offset_yaw\": "<<config.offsetYaw<<",\n  \"offset_pitch\": "<<config.offsetPitch
            <<",\n  \"data_age_ms\": "<<(point.time?int64_t(GetTickCount64()-point.time):-1)
            <<",\n  \"point\": ["<<point.x<<","<<point.y<<","<<point.z<<"],\n  \"flip_x\": "<<(config.flipX?"true":"false")
            <<",\n  \"flip_y\": "<<(config.flipY?"true":"false")<<"\n}\n";
@@ -179,8 +203,14 @@ class Provider:public vr::IServerTrackedDeviceProvider {
                 HMODULE module=nullptr;
                 if(GetModuleHandleExW(0,L"driver_vrlink.dll",&module)) {
                     checked=true;
-                    if(Verify(module)){pinned=module;verified=reinterpret_cast<uint8_t*>(module);}
-                    else {FreeLibrary(module);Log("SteamLinkEyeInput: unsupported Steam Link binary; private calls disabled.");}
+                    auto base=reinterpret_cast<uint8_t*>(module);
+                    auto dos=reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+                    auto nt=reinterpret_cast<const IMAGE_NT_HEADERS64*>(base+dos->e_lfanew);
+                    eye::native::Image image(base,nt->OptionalHeader.SizeOfImage,uintptr_t(base));
+                    if(image.Parse()&&image.Resolve(layout,resolution)){
+                        knownBinary=Verify(module);pinned=module;verified=base;
+                        Log("SteamLinkEyeInput: native layout resolved by packet, unwind, RTTI and encoder checks.");
+                    } else {FreeLibrary(module);Log(("SteamLinkEyeInput: private calls disabled: "+resolution).c_str());}
                 }
                 lastVerify=now;
             }
@@ -215,14 +245,16 @@ public:
         host=static_cast<vr::IVRServerDriverHost*>(context->GetGenericInterface(vr::IVRServerDriverHost_Version));
         root=Root();stop=false;fault=false;shown=false;connected=false;verified=nullptr;socketError=0;enabled=true;started=GetTickCount64();dashboardRequested=false;
         marker={};lastSession=0;markerDesired=false;markerActive=false;
+        layout={};knownBinary=false;resolution="not checked";dotWriter.Open();
         lastSequence=lastShow=0;lastHmd=nullptr;active=false;accepted=0;packets=0;bad=0;latest={};
         try{worker=std::thread([this]{try{Work();}catch(...){fault=true;Log("SteamLinkEyeInput: worker stopped after exception.");}});}
         catch(...){return vr::VRInitError_Driver_Failed;}
-        Log("SteamLinkEyeInput 1.3.0: provider loaded; upstream calibration only.");
+        Log("SteamLinkEyeInput 1.3.0: provider loaded; upstream calibration with manual angular trim.");
         return vr::VRInitError_None;
     }
     void Cleanup() override {
         stop=true;if(worker.joinable())worker.join();
+        dotWriter.Close();
         // No native call on teardown: Valve may already have destroyed its HMD.
         // The native encoder's own 250 ms timestamp timeout expires old gaze.
         verified=nullptr;if(pinned){FreeLibrary(pinned);pinned=nullptr;}
@@ -230,6 +262,7 @@ public:
     }
     const char* const* GetInterfaceVersions() override{return vr::k_InterfaceVersions;}
     void RunFrame() override {
+        eye::DotFrame dotFrame(dotWriter);
         if(!dashboardRequested && GetTickCount64()-started>3000){
             dashboardRequested=true;
             auto appRoot=root.parent_path();auto executable=appRoot/L"SteamLinkEyeInputControl.exe";
@@ -240,23 +273,26 @@ public:
         }
         auto base=verified.load();if(!base||fault)return;
         auto now=GetTickCount64();
-        if(!shown && now-lastShow>=1000){lastShow=now;if(ShowOptions(base)==0){shown=true;Log("SteamLinkEyeInput: OSC options exposed.");}}
-        void* hmd=CurrentHmd(base);
+        // Optional menu helper retains an exact-hash guard; it is not required
+        // for native gaze submission and is never guessed on another binary.
+        if(knownBinary&&!shown && now-lastShow>=1000){lastShow=now;if(ShowOptions(base)==0){shown=true;Log("SteamLinkEyeInput: OSC options exposed.");}}
+        void* hmd=CurrentHmd(base,layout);
         if(host) {vr::TrackedDevicePose_t pose{};host->GetRawTrackedDevicePoses(0,&pose,1);if(!pose.bDeviceIsConnected)hmd=nullptr;}
         connected=hmd!=nullptr;
-        auto session=Session(hmd);
+        auto session=Session(hmd,layout);
         if(hmd!=lastHmd || session!=lastSession){lastHmd=hmd;lastSession=session;lastSequence=0;active=false;marker={};markerActive=false;}
         if(!hmd)return;
-        if(!SetCross(hmd,marker,markerDesired && enabled)){fault=true;return;}
+        if(!SetCross(hmd,layout,marker,markerDesired && enabled)){fault=true;return;}
         markerActive=markerDesired && enabled;
+        if(markerActive)ReadCrop(hmd,layout,dotFrame.sample);
         eye::Point point;
         {std::unique_lock<std::mutex> guard(lock,std::try_to_lock);if(!guard.owns_lock())return;point=latest;}
         now=GetTickCount64();
         bool fresh=enabled && point.time && now-point.time<=150;
-        if(!fresh){if(active){point.valid=false;if(!Apply(base,hmd,point))fault=true;active=false;}return;}
+        if(!fresh){if(active){point.valid=false;if(!Apply(base,layout,hmd,point))fault=true;active=false;}return;}
         if(point.sequence==lastSequence)return;
         lastSequence=point.sequence;
-        if(Apply(base,hmd,point)){++accepted;active=point.valid;}
+        if(Apply(base,layout,hmd,point)){++accepted;active=point.valid;}
         else {fault=true;Log("SteamLinkEyeInput: native eye handler fault; stopped for this session.");}
     }
     bool ShouldBlockStandbyMode() override{return false;}
