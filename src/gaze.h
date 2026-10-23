@@ -53,18 +53,26 @@ struct Config {
     bool enabled=true,flipX=false,flipY=false,showGazeCenter=false;
     int port=9100;
     float yaw=35,pitch=30,depth=2,offsetYaw=0,offsetPitch=0;
+    std::array<float,4> directionGain={1,1,1,1}; // left, right, up, down
     Addresses addresses=DefaultAddresses();
 };
 struct Point { float x=0,y=0,z=-2;bool valid=false;uint64_t sequence=0,time=0; };
 struct Tracker {
     std::array<float,6> values={0,0,0,0,1,1};
     std::array<uint64_t,6> updated{};
-    unsigned dirty=0;uint64_t sequence=0;
+    unsigned seen=0;uint64_t sequence=0;
+    std::array<uint64_t,6> updates{},changes{};
+    float inputX=0,inputY=0,angleX=0,angleY=0;
     bool Accept(const std::vector<Message>& messages,uint64_t now,const Config& config,Point& out) {
-        for(auto m:messages){values[m.index]=m.value;updated[m.index]=now;dirty|=1u<<m.index;}
-        if((dirty&15)!=15)return false;
-        dirty&=~15u;
-        for(int i=0;i<4;++i)if(now-updated[i]>150)return false;
+        if(messages.empty())return false;
+        for(auto m:messages){if(!(seen&(1u<<m.index))||values[m.index]!=m.value)++changes[m.index];
+            values[m.index]=m.value;updated[m.index]=now;seen|=1u<<m.index;++updates[m.index];}
+        return Map(now,config,out);
+    }
+    bool Map(uint64_t now,const Config& config,Point& out) {
+        // Independent OSC updates reuse recent channels, never expired values.
+        if((seen&15)!=15)return false;
+        for(int i=0;i<4;++i)if(now<updated[i]||now-updated[i]>150)return false;
         float x=0,y=0;int opened=0;
         for(int side=0;side<2;++side) {
             // A stale lid sample is treated as unknown/open; fresh closures suppress gaze.
@@ -73,11 +81,16 @@ struct Tracker {
             x+=values[side];y+=values[2+side];++opened;
         }
         if(opened){x/=opened;y/=opened;}
+        inputX=x;inputY=y;
         if(config.flipX)x=-x;if(config.flipY)y=-y;
+        // Scale around the trimmed optical center, not the raw input origin.
+        float baseX=std::clamp(x,-1.f,1.f)*config.yaw+config.offsetYaw;
+        float baseY=std::clamp(y,-1.f,1.f)*config.pitch+config.offsetPitch;
+        angleX=std::clamp(baseX*config.directionGain[baseX<0?0:1],-89.f,89.f);
+        angleY=std::clamp(baseY*config.directionGain[baseY<0?3:2],-89.f,89.f);
         constexpr float radians=3.14159265358979323846f/180;
-        out={config.depth*std::tan(std::clamp(std::clamp(x,-1.f,1.f)*config.yaw+config.offsetYaw,-89.f,89.f)*radians),
-             config.depth*std::tan(std::clamp(std::clamp(y,-1.f,1.f)*config.pitch+config.offsetPitch,-89.f,89.f)*radians),
-             -config.depth,opened>0,++sequence,now};
+        out={config.depth*std::tan(angleX*radians),config.depth*std::tan(angleY*radians),
+             -config.depth,opened>0,++sequence,*std::min_element(updated.begin(),updated.begin()+4)};
         return true;
     }
 };

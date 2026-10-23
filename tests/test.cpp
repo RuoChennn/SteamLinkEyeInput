@@ -74,16 +74,25 @@ int wmain(int argc,wchar_t** argv) {
             Context context;
             WSADATA data;Check(!WSAStartup(MAKEWORD(2,2),&data),"test sockets");
             for(int session=0;session<2;++session) {
+                auto fixtureRoot=std::filesystem::path(argv[1]).parent_path().parent_path().parent_path();
+                {std::ofstream configFile(fixtureRoot/L"steamlinkeyeinput.ini");configFile<<"[steamlinkeyeinput]\nport=19100\n";
+                 if(session==1)configFile<<"gain_left=1.5\ngain_right=1.25\ngain_up=1.2\ngain_down=0.8\n";}
                 Check(provider->Init(&context)==vr::VRInitError_None,"provider init");
                 for(int frame=0;frame<25;++frame){provider->RunFrame();Sleep(10);}
                 SOCKET socket=::socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP);sockaddr_in address{};
                 address.sin_family=AF_INET;address.sin_addr.s_addr=htonl(INADDR_LOOPBACK);address.sin_port=htons(19100);
                 for(int i=0;i<6;++i){auto packet=Message(eye::Names[i],i<4?.25f:1.f);Check(sendto(socket,reinterpret_cast<const char*>(packet.data()),int(packet.size()),0,reinterpret_cast<sockaddr*>(&address),sizeof(address))==int(packet.size()),"UDP send");}
-                closesocket(socket);Sleep(100);
+                Sleep(20);
+                for(int i=0;i<2;++i){auto packet=Message(eye::Names[i],.251f);Check(sendto(socket,reinterpret_cast<const char*>(packet.data()),int(packet.size()),0,reinterpret_cast<sockaddr*>(&address),sizeof(address))==int(packet.size()),"sparse horizontal UDP send");}
+                closesocket(socket);Sleep(70);
                 provider->Cleanup();
                 auto statusPath=std::filesystem::path(argv[1]).parent_path().parent_path().parent_path()/L"status.json";
                 std::ifstream status(statusPath);std::string text((std::istreambuf_iterator<char>(status)),{});
-                Check(text.find("\"packets\": 6")!=std::string::npos,"real UDP datagrams received inside DLL");
+                Check(text.find("\"packets\": 8")!=std::string::npos,"real UDP datagrams received inside DLL");
+                Check(text.find("\"channel_updates\": [2,2,1,1,1,1]")!=std::string::npos,"raw channel counters record sparse updates");
+                auto at=text.find("\"point\": [");Check(at!=std::string::npos&&std::stof(text.substr(at+10))>.308f,"real receiver publishes micro movement without new vertical packets");
+                float actualX=std::stof(text.substr(at+10));float expectedX=2*std::tan(.251f*35*(session==1?1.25f:1.f)*3.14159265f/180);
+                Check(std::fabs(actualX-expectedX)<1e-5f,"real UDP receiver applies configured directional gain");
                 Check(text.find("\"socket_error\": 0")!=std::string::npos,"UDP receiver bound");
                 Check(text.find("\"running\": false")!=std::string::npos,"worker stopped before unload");
             }

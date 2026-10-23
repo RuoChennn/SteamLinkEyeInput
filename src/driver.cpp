@@ -9,6 +9,7 @@
 #include <mutex>
 #include <fstream>
 #include <sstream>
+#include <iomanip>
 #include <filesystem>
 #include "vendor/openvr_driver.h"
 #include "gaze.h"
@@ -157,6 +158,10 @@ class Provider:public vr::IServerTrackedDeviceProvider {
                 else if(key=="port"){if(number<1024||number>65535||floorf(number)!=number)return previous;result.port=int(number);}
                 else if(key=="yaw"){if(number<=0||number>90)return previous;result.yaw=number;}
                 else if(key=="pitch"){if(number<=0||number>90)return previous;result.pitch=number;}
+                else if(key=="gain_left"||key=="gain_right"||key=="gain_up"||key=="gain_down"){
+                    if(number<.1f||number>4)return previous;
+                    int side=key=="gain_left"?0:key=="gain_right"?1:key=="gain_up"?2:3;result.directionGain[side]=number;
+                }
                 else if(key=="offset_yaw"){if(number< -20||number>20)return previous;result.offsetYaw=number;}
                 else if(key=="offset_pitch"){if(number< -20||number>20)return previous;result.offsetPitch=number;}
                 else if(key=="depth"){if(number<.1f||number>5)return previous;result.depth=number;}
@@ -166,7 +171,7 @@ class Provider:public vr::IServerTrackedDeviceProvider {
         for(int i=0;i<6;++i)for(int j=i+1;j<6;++j)if(result.addresses[i]==result.addresses[j])return previous;
         return result;
     }
-    void Status(const eye::Config& config,const eye::Point& point,bool done=false) {
+    void Status(const eye::Config& config,const eye::Point& point,const eye::Tracker& tracker,bool done=false) {
         auto path=root/L"status.json",temp=root/L"status.tmp";
         std::ofstream out(temp,std::ios::trunc);if(!out)return;
         out<<"{\n  \"running\": "<<(!done?"true":"false")<<",\n  \"pid\": "<<GetCurrentProcessId()
@@ -185,7 +190,17 @@ class Provider:public vr::IServerTrackedDeviceProvider {
            <<",\n  \"offset_yaw\": "<<config.offsetYaw<<",\n  \"offset_pitch\": "<<config.offsetPitch
            <<",\n  \"data_age_ms\": "<<(point.time?int64_t(GetTickCount64()-point.time):-1)
            <<",\n  \"point\": ["<<point.x<<","<<point.y<<","<<point.z<<"],\n  \"flip_x\": "<<(config.flipX?"true":"false")
-           <<",\n  \"flip_y\": "<<(config.flipY?"true":"false")<<"\n}\n";
+           <<",\n  \"flip_y\": "<<(config.flipY?"true":"false");
+        // Keep source observations independent from generated gaze: counters
+        // expose small changes even when a 500 ms status snapshot misses them.
+        out<<std::setprecision(9)<<",\n  \"telemetry_version\": 1,\n  \"status_tick\": "<<GetTickCount64()
+           <<",\n  \"input\": ["<<tracker.inputX<<","<<tracker.inputY<<"],\n  \"angles\": ["<<tracker.angleX<<","<<tracker.angleY<<"]";
+        auto array=[&](const char* key,const auto& values){out<<",\n  \""<<key<<"\": [";for(size_t i=0;i<values.size();++i){if(i)out<<",";out<<values[i];}out<<"]";};
+        array("raw",tracker.values);array("channel_updates",tracker.updates);array("channel_changes",tracker.changes);
+        array("direction_gain",config.directionGain);
+        std::array<int64_t,6> ages{};auto tick=GetTickCount64();
+        for(int i=0;i<6;++i)ages[i]=tracker.updates[i]?int64_t(tick-tracker.updated[i]):-1;
+        array("channel_age_ms",ages);out<<"\n}\n";
         out.close();if(!out)return;
         // Telemetry failure must not stall eye tracking or the SteamVR frame loop.
         MoveFileExW(temp.c_str(),path.c_str(),MOVEFILE_REPLACE_EXISTING);
@@ -198,7 +213,14 @@ class Provider:public vr::IServerTrackedDeviceProvider {
         bool checked=false;
         while(!stop) {
             auto now=GetTickCount64();
-            if(now-lastConfig>=500 || !lastConfig){config=ReadConfig(config);enabled=config.enabled;markerDesired=config.showGazeCenter;lastConfig=now;}
+            bool remapped=false;
+            if(now-lastConfig>=500 || !lastConfig){auto next=ReadConfig(config);
+                bool newSource=next.addresses!=config.addresses;
+                bool newMapping=next.directionGain!=config.directionGain||next.yaw!=config.yaw||next.pitch!=config.pitch||next.depth!=config.depth||
+                    next.offsetYaw!=config.offsetYaw||next.offsetPitch!=config.offsetPitch||next.flipX!=config.flipX||next.flipY!=config.flipY;
+                config=next;if(newSource){tracker={};point={};remapped=true;}
+                else if(newMapping)remapped=tracker.Map(now,config,point);
+                enabled=config.enabled;markerDesired=config.showGazeCenter;lastConfig=now;}
             if(!checked && now-lastVerify>=1000) {
                 HMODULE module=nullptr;
                 if(GetModuleHandleExW(0,L"driver_vrlink.dll",&module)) {
@@ -224,7 +246,7 @@ class Provider:public vr::IServerTrackedDeviceProvider {
                     socketError=WSAGetLastError();if(socket!=INVALID_SOCKET)closesocket(socket);socket=INVALID_SOCKET;
                 } else {socketError=0;boundPort=config.port;Log("SteamLinkEyeInput: OSC receiver bound to 127.0.0.1.");}
             }
-            bool changed=false;
+            bool changed=remapped;
             if(socket!=INVALID_SOCKET)for(int i=0;i<256;++i) {
                 uint8_t bytes[8192];int size=recv(socket,reinterpret_cast<char*>(bytes),sizeof(bytes),0);
                 if(size==SOCKET_ERROR){int error=WSAGetLastError();if(error!=WSAEWOULDBLOCK){socketError=error;if(error==WSAEMSGSIZE)++bad;}break;}
@@ -233,10 +255,10 @@ class Provider:public vr::IServerTrackedDeviceProvider {
                 if(tracker.Accept(messages,GetTickCount64(),config,point))changed=true;
             }
             if(changed){std::lock_guard<std::mutex> guard(lock);latest=point;}
-            if(now-lastStatus>=500){Status(config,point);lastStatus=now;}
+            if(now-lastStatus>=500){Status(config,point,tracker);lastStatus=now;}
             Sleep(2);
         }
-        if(socket!=INVALID_SOCKET)closesocket(socket);WSACleanup();Status(config,point,true);
+        if(socket!=INVALID_SOCKET)closesocket(socket);WSACleanup();Status(config,point,tracker,true);
     }
 public:
     vr::EVRInitError Init(vr::IVRDriverContext* context) override {
@@ -249,7 +271,7 @@ public:
         lastSequence=lastShow=0;lastHmd=nullptr;active=false;accepted=0;packets=0;bad=0;latest={};
         try{worker=std::thread([this]{try{Work();}catch(...){fault=true;Log("SteamLinkEyeInput: worker stopped after exception.");}});}
         catch(...){return vr::VRInitError_Driver_Failed;}
-        Log("SteamLinkEyeInput 1.3.0: provider loaded; upstream calibration with manual angular trim.");
+        Log("SteamLinkEyeInput 1.4.0: provider loaded; upstream calibration with manual angular trim.");
         return vr::VRInitError_None;
     }
     void Cleanup() override {
